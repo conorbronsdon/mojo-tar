@@ -1,0 +1,27 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install Mojo nightly
+        run: |
+          uv venv
+          uv pip install mojo \
+            --index https://whl.modular.com/nightly/simple/ \
+            --prerelease allow
+          .venv/bin/mojo --version
+
+      - name: Tests
+        run: .venv/bin/mojo run -I src test/test_tar.mojo

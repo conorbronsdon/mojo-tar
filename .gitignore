@@ -1,0 +1,6 @@
+.venv/
+.pixi/
+pixi.lock
+*.mojopkg
+__pycache__/
+test/data/src_tree/
