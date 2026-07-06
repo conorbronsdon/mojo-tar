@@ -23,6 +23,7 @@ comptime GNU_LONGNAME = UInt8(ord("L"))  # GNU long name for the next header
 comptime GNU_LONGLINK = UInt8(ord("K"))  # GNU long linkname for the next header
 comptime XHDTYPE = UInt8(ord("x"))  # pax per-file extended header
 comptime XGLTYPE = UInt8(ord("g"))  # pax global extended header
+comptime GNU_SPARSE = UInt8(ord("S"))  # GNU sparse file (unsupported)
 
 
 @fieldwise_init

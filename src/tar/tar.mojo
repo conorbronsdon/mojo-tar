@@ -19,6 +19,12 @@ the round trip and is readable by system `tar`.
 No compression is in scope. For `.tar.gz` / `.tar.bz2`, pair this with a
 separate zlib/gzip library and feed the decompressed bytes to
 `open_tar` (or compress `TarWriter.finalize()`'s output).
+
+Sparse files are not in scope either: a GNU sparse member (typeflag `S`,
+or a member carrying `GNU.sparse.*` pax records) stores a hole map plus
+only the non-hole bytes, so its archived length differs from its logical
+size. Rather than mis-read the sparse-encoded bytes as file content and
+desync the rest of the parse, `open_tar` raises on any sparse member.
 """
 
 from std.memory import memcpy
@@ -35,6 +41,7 @@ from tar.model import (
     GNU_LONGLINK,
     XHDTYPE,
     XGLTYPE,
+    GNU_SPARSE,
 )
 
 comptime BLOCKSIZE = 512
@@ -76,21 +83,27 @@ def _get_octal(block: Span[UInt8, _], offset: Int, length: Int) -> Int:
     while i < end and (block[i] == _SPACE or block[i] == _NUL):
         i += 1
     while (
-        i < end
-        and block[i] >= UInt8(ord("0"))
-        and block[i] <= UInt8(ord("7"))
+        i < end and block[i] >= UInt8(ord("0")) and block[i] <= UInt8(ord("7"))
     ):
         v = v * 8 + Int(block[i]) - ord("0")
         i += 1
     return v
 
 
-def _get_num(block: Span[UInt8, _], offset: Int, length: Int) -> Int:
+def _get_num(block: Span[UInt8, _], offset: Int, length: Int) raises -> Int:
     """Parse a numeric field: base-256 if the high bit is set, else octal."""
     var first = block[offset]
     if (first & 0x80) != 0:
+        # Base-256. A ustar numeric field is up to 12 bytes wide, i.e. 95
+        # usable bits after the 0x80 flag, but the result must fit a signed
+        # 64-bit Int. Guard every shift: if the running value already
+        # occupies the high 8 bits, the next `<< 8` would overflow and
+        # silently wrap a huge (95-bit) size down into a small — or
+        # negative — one. Reject rather than wrap.
         var v = Int(first & 0x7F)
         for i in range(offset + 1, offset + length):
+            if v > (Int.MAX >> 8):
+                raise Error("mojo-tar: base-256 numeric field exceeds 64 bits")
             v = (v << 8) | Int(block[i])
         return v
     return _get_octal(block, offset, length)
@@ -160,6 +173,28 @@ def _parse_header(block: Span[UInt8, _]) raises -> TarInfo:
     )
 
 
+def _has_gnu_sparse(fields: Dict[String, String]) -> Bool:
+    """True if pax fields describe a GNU sparse member (any format version).
+
+    GNU sparse encodes a file's data as a hole map plus only the non-hole
+    bytes, so the archived data length differs from the logical `size`.
+    Honoring it correctly requires materializing the holes; treating the
+    sparse-encoded bytes as file content — or advancing `pos` by the logical
+    size — desyncs the parse. We detect and reject rather than mis-read.
+    """
+    return (
+        "GNU.sparse.major" in fields
+        or "GNU.sparse.minor" in fields
+        or "GNU.sparse.name" in fields
+        or "GNU.sparse.realsize" in fields
+        or "GNU.sparse.size" in fields
+        or "GNU.sparse.map" in fields
+        or "GNU.sparse.numblocks" in fields
+        or "GNU.sparse.offset" in fields
+        or "GNU.sparse.numbytes" in fields
+    )
+
+
 def _parse_pax(records: Span[UInt8, _], mut fields: Dict[String, String]):
     """Parse pax `len key=value\\n` records into `fields`.
 
@@ -221,18 +256,48 @@ def _parse_archive(
 
         var stored = _get_octal(block, 148, 8)
         if _compute_checksum(block) != stored:
-            if len(entries) == 0 and not have_long_name and not (
-                have_long_link
-            ) and len(pax) == 0:
+            if (
+                len(entries) == 0
+                and not have_long_name
+                and not (have_long_link)
+                and len(pax) == 0
+            ):
                 raise Error(
-                    "mojo-tar: bad checksum in first block (not a tar"
-                    " archive?)"
+                    "mojo-tar: bad checksum in first block (not a tar archive?)"
+                )
+            # Skip the WHOLE member -- header PLUS its (padded) data run --
+            # never just the header. Advancing a single block would
+            # reinterpret this member's data as the next headers, so a file
+            # whose contents are themselves a valid tar would surface its
+            # inner members as top-level entries (content smuggling /
+            # scanner-evasion differential). The size field is untrusted on
+            # a corrupt block, so only resync when it is plausible; abort
+            # otherwise rather than guess at where the data ends.
+            var bad_size = _get_num(block, 124, 12)
+            if bad_size < 0 or bad_size > n:
+                raise Error(
+                    "mojo-tar: unrecoverable bad checksum at offset "
+                    + String(pos)
+                    + " (implausible member size, cannot resync)"
+                )
+            var skip_end = pos + BLOCKSIZE + _padded(bad_size)
+            if skip_end > n:
+                raise Error(
+                    "mojo-tar: unrecoverable bad checksum at offset "
+                    + String(pos)
+                    + " (member data runs past end, cannot resync)"
                 )
             warnings.append(
                 "mojo-tar: skipped member with bad checksum at offset "
                 + String(pos)
             )
-            pos += BLOCKSIZE
+            pos = skip_end
+            # A corrupt member must not carry pending extension-header
+            # overrides (GNU long name/link, pax) forward onto a later
+            # member; drop any that were pending.
+            have_long_name = False
+            have_long_link = False
+            pax.clear()
             continue
 
         var info = _parse_header(block)
@@ -242,9 +307,7 @@ def _parse_archive(
         # larger than the whole archive is hostile: it can make _padded()
         # negative and rewind `pos`, re-parsing the same header forever.
         if declared < 0 or declared > n:
-            raise Error(
-                "mojo-tar: implausible entry size " + String(declared)
-            )
+            raise Error("mojo-tar: implausible entry size " + String(declared))
         var data_end = pos + _padded(declared)
         # Monotonic-progress guard: the next position must advance past the
         # block we started this iteration on, or we would loop forever.
@@ -276,8 +339,18 @@ def _parse_archive(
             _parse_pax(data[pos : pos + declared], pax)
             pos = data_end
             continue
+        if info.typeflag == GNU_SPARSE:
+            raise Error(
+                "mojo-tar: GNU sparse members (typeflag 'S') are not"
+                " supported (would desync the parse)"
+            )
 
         # A real member: apply any pending overrides.
+        if _has_gnu_sparse(pax):
+            raise Error(
+                "mojo-tar: GNU sparse members (GNU.sparse.* pax records) are"
+                " not supported (would desync the parse)"
+            )
         if have_long_name:
             info.name = long_name.copy()
             have_long_name = False
@@ -294,8 +367,7 @@ def _parse_archive(
             # negative or implausibly large values before they can rewind pos.
             if override_size < 0 or override_size > n:
                 raise Error(
-                    "mojo-tar: implausible entry size "
-                    + String(override_size)
+                    "mojo-tar: implausible entry size " + String(override_size)
                 )
             # The pax size governs the true content length; re-read the
             # payload if it differs from the header's declared size.
@@ -432,15 +504,29 @@ def _octal_str(value: Int, width: Int) -> String:
         v = v >> 3
     var out = String()
     for i in range(width):
-        out += String(StringSlice(unsafe_from_utf8=digits[width - 1 - i : width - i]))
+        out += String(
+            StringSlice(unsafe_from_utf8=digits[width - 1 - i : width - i])
+        )
     return out^
 
 
 def _set_str(mut buf: List[UInt8], offset: Int, s: String, maxlen: Int) raises:
     var bytes = s.as_bytes()
     var count = len(bytes)
+    # Silently truncating a name/linkname/uname/gname that overflows its
+    # fixed-width header field corrupts the value on read-back. Callers that
+    # can carry an over-length value (name, linkname) must emit a pax record
+    # and pass a pre-truncated field; anything still over-length here is a
+    # bug or an unrepresentable uname/gname, so raise rather than truncate.
     if count > maxlen:
-        count = maxlen
+        raise Error(
+            "mojo-tar: value of length "
+            + String(count)
+            + " exceeds "
+            + String(maxlen)
+            + "-byte header field: "
+            + s
+        )
     for i in range(count):
         # An embedded NUL would truncate the field on read-back (NUL is the
         # field terminator), silently corrupting the name/linkname.
@@ -576,11 +662,7 @@ struct TarWriter(Movable):
         for _ in range(pad):
             self._blocks.append(_NUL)
 
-    def _emit_pax_path(mut self, name: String) raises:
-        # The full name goes verbatim into the pax record data, bypassing
-        # _set_str's per-field NUL guard, so validate the whole thing here.
-        _reject_nul(name)
-        var records = _pax_record("path", name)
+    def _emit_pax_header(mut self, records: String) raises:
         var rec_bytes = records.as_bytes()
         var hdr = _build_header(
             name="PaxHeader",
@@ -596,6 +678,12 @@ struct TarWriter(Movable):
         )
         self._extend(hdr)
         self._append_padded_data(rec_bytes)
+
+    def _emit_pax_path(mut self, name: String) raises:
+        # The full name goes verbatim into the pax record data, bypassing
+        # _set_str's per-field NUL guard, so validate the whole thing here.
+        _reject_nul(name)
+        self._emit_pax_header(_pax_record("path", name))
 
     def add(
         mut self,
@@ -660,9 +748,28 @@ struct TarWriter(Movable):
         mode: Int = 0o777,
         mtime: Int = 0,
     ) raises:
-        """Append a symbolic-link member pointing at `target`."""
+        """Append a symbolic-link member pointing at `target`.
+
+        A name or target longer than 100 bytes is written with a leading
+        pax extended header (`path` / `linkpath` records) so the full
+        values survive the round trip, mirroring `add`. Without this the
+        over-length field would be silently truncated in the ustar header.
+        """
+        var stored_name = name
+        var stored_target = target
+        var records = String()
+        if name.byte_length() > 100:
+            _reject_nul(name)
+            records += _pax_record("path", name)
+            stored_name = _truncate_bytes(name, 100)
+        if target.byte_length() > 100:
+            _reject_nul(target)
+            records += _pax_record("linkpath", target)
+            stored_target = _truncate_bytes(target, 100)
+        if records.byte_length() > 0:
+            self._emit_pax_header(records)
         var hdr = _build_header(
-            name=name,
+            name=stored_name,
             size=0,
             mode=mode,
             mtime=mtime,
@@ -671,7 +778,7 @@ struct TarWriter(Movable):
             gid=0,
             uname=String(),
             gname=String(),
-            linkname=target,
+            linkname=stored_target,
         )
         self._extend(hdr)
 

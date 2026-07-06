@@ -6,7 +6,13 @@ binary (`--format=ustar|gnu|pax`); the writer round-trip and interop
 checks were also verified against system `tar -tf`/`-xf` at build time.
 """
 
-from std.testing import assert_equal, assert_true, assert_false, assert_raises, TestSuite
+from std.testing import (
+    assert_equal,
+    assert_true,
+    assert_false,
+    assert_raises,
+    TestSuite,
+)
 
 from tar import (
     open_tar,
@@ -231,9 +237,7 @@ def test_pax_path_override() raises:
     )
     var info = _find(entries, longname)
     assert_equal(info.size, 18)
-    assert_equal(
-        _content(_find_entry(entries, "hello.txt")), "hello world\n"
-    )
+    assert_equal(_content(_find_entry(entries, "hello.txt")), "hello world\n")
 
 
 def test_dirs_fixture_directory_typeflag() raises:
@@ -383,7 +387,9 @@ def _put_octal(mut b: List[UInt8], off: Int, width: Int, value: Int):
     b[off + width - 1] = UInt8(0)
 
 
-def _make_header(name: String, size: Int, typeflag: UInt8) raises -> List[UInt8]:
+def _make_header(
+    name: String, size: Int, typeflag: UInt8
+) raises -> List[UInt8]:
     """Build a single forged-valid ustar header block for hostile fixtures."""
     var b = List[UInt8]()
     for _ in range(BLOCKSIZE):
@@ -471,6 +477,155 @@ def test_writer_embedded_nul_name_raises() raises:
     var w = TarWriter()
     with assert_raises():
         w.add(name, String("d").as_bytes())
+
+
+# --- hardening regression tests (multi-agent review) -------------------
+
+
+def test_bad_checksum_data_not_reinterpreted() raises:
+    # Headline finding: a file member whose *content* is itself a valid tar
+    # must NOT have that content reinterpreted as top-level headers when the
+    # member's own header has a bad checksum. Otherwise a scanner sees one
+    # opaque (corrupt) file while mojo-tar surfaces the smuggled inner
+    # member -- a content-smuggling / scanner-evasion differential.
+    var inner = TarWriter()
+    inner.add("SMUGGLED.txt", String("hidden-evil-payload\n").as_bytes())
+    var inner_bytes = inner.finalize()
+
+    var outer = TarWriter()
+    outer.add("readme.txt", String("ok").as_bytes())  # header@0, data@512
+    outer.add("innocent.dat", Span(inner_bytes))  # header@1024
+    var archive = outer.finalize()
+
+    # Corrupt the second member's name byte -> checksum mismatch, size intact.
+    archive[1024] = UInt8(ord("Z"))
+
+    var reader = TarReader(Span(archive))
+    var names = reader.names()
+    # The whole corrupt member (header + data) is skipped as a unit; the
+    # smuggled inner member never appears.
+    for name in names:
+        assert_true(name != "SMUGGLED.txt")
+    assert_equal(len(names), 1)
+    assert_equal(names[0], "readme.txt")
+    assert_true(len(reader.warnings) >= 1)
+
+
+def test_bad_checksum_implausible_size_raises() raises:
+    # If a corrupt member's size field is not plausible, we cannot know where
+    # its data ends, so resync is impossible: raise rather than guess.
+    var w = TarWriter()
+    w.add("first.txt", String("AAAA").as_bytes())  # header@0, data@512
+    w.add("second.txt", String("BBBB").as_bytes())  # header@1024
+    var archive = w.finalize()
+    # Corrupt second.txt: bad checksum AND a base-256 size larger than the
+    # archive (high bit set, huge value).
+    archive[1024] = UInt8(ord("Z"))  # break checksum
+    archive[1024 + 124] = UInt8(0x80)  # size field: base-256 flag
+    archive[1024 + 125] = UInt8(0x01)  # a high byte -> value >> archive size
+    with assert_raises():
+        _ = open_tar(Span(archive))
+
+
+def test_base256_oversized_size_raises() raises:
+    # A base-256 size field with a nonzero byte above the low 8 encodes a
+    # value beyond 64 bits; decoding it would silently wrap. Must raise.
+    var w = TarWriter()
+    w.add("x", String("x").as_bytes())
+    var archive = w.finalize()
+    var block = List[UInt8]()
+    for i in range(BLOCKSIZE):
+        block.append(archive[i])
+    block[124] = UInt8(0x80)  # base-256 flag
+    for i in range(125, 136):
+        block[i] = UInt8(0)
+    block[125] = UInt8(0x01)  # high byte, well above the low 8 bytes
+    _fix_checksum(block, 0)
+    with assert_raises():
+        _ = open_tar(Span(block))
+
+
+def test_writer_symlink_long_name_roundtrips() raises:
+    # add_symlink with a >100-byte name must emit a pax `path` record so the
+    # full name survives, rather than silently truncating the ustar field.
+    var longname = String(
+        "some/very/deeply/nested/path/"
+        "a_symlink_name_that_is_intentionally_longer_than_one_hundred_bytes_"
+        "to_force_a_pax_path_record_xyz"
+    )
+    assert_true(longname.byte_length() > 100)
+    var w = TarWriter()
+    w.add_symlink(longname, "target.txt")
+    var entries = open_tar(Span(w.finalize()))
+    assert_equal(len(entries), 1)
+    assert_true(entries[0].info.issym())
+    assert_equal(entries[0].info.name, longname)
+    assert_equal(entries[0].info.linkname, "target.txt")
+
+
+def test_writer_symlink_long_target_roundtrips() raises:
+    # add_symlink with a >100-byte target must emit a pax `linkpath` record.
+    var longtarget = String(
+        "/an/absolute/and/"
+        "intentionally_very_long_symlink_target_path_exceeding_one_hundred_"
+        "bytes_so_that_the_linkname_field_overflows_abcdef"
+    )
+    assert_true(longtarget.byte_length() > 100)
+    var w = TarWriter()
+    w.add_symlink("shortcut", longtarget)
+    var entries = open_tar(Span(w.finalize()))
+    assert_equal(len(entries), 1)
+    assert_true(entries[0].info.issym())
+    assert_equal(entries[0].info.name, "shortcut")
+    assert_equal(entries[0].info.linkname, longtarget)
+
+
+def test_writer_oversized_uname_raises() raises:
+    # A uname longer than the 32-byte header field must raise rather than be
+    # silently truncated (there is no pax fallback for uname/gname here).
+    var longuname = String(
+        "a_user_name_that_is_way_longer_than_thirty_two_bytes"
+    )
+    assert_true(longuname.byte_length() > 32)
+    var w = TarWriter()
+    with assert_raises():
+        w.add("f", String("d").as_bytes(), uname=longuname)
+
+
+def test_gnu_sparse_typeflag_raises() raises:
+    # A GNU sparse member (typeflag 'S') would desync the parse; reject it.
+    var archive = List[UInt8]()
+    var hdr = _make_header("sparse.dat", 0, UInt8(ord("S")))
+    for b in hdr:
+        archive.append(b)
+    for _ in range(BLOCKSIZE * 2):  # end-of-archive
+        archive.append(UInt8(0))
+    with assert_raises():
+        _ = open_tar(Span(archive))
+
+
+def test_gnu_sparse_pax_raises() raises:
+    # A member described by GNU.sparse.* pax records would desync; reject it.
+    var record = String("22 GNU.sparse.major=1\n")
+    assert_equal(record.byte_length(), 22)
+    var archive = List[UInt8]()
+    var paxhdr = _make_header(
+        "PaxHeader", record.byte_length(), UInt8(ord("x"))
+    )
+    for b in paxhdr:
+        archive.append(b)
+    var rb = record.as_bytes()
+    for i in range(len(rb)):
+        archive.append(rb[i])
+    for _ in range(BLOCKSIZE - len(rb)):  # pad pax data to a full block
+        archive.append(UInt8(0))
+    var memhdr = _make_header("f.txt", 0, UInt8(ord("0")))
+    for b in memhdr:
+        archive.append(b)
+    for _ in range(BLOCKSIZE * 2):  # end-of-archive
+        archive.append(UInt8(0))
+    with assert_raises():
+        _ = open_tar(Span(archive))
 
 
 def main() raises:

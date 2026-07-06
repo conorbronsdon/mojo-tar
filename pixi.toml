@@ -12,4 +12,4 @@ fuzz = "mojo run -I src test/fuzz_runner.mojo test/data/ustar.tar"
 demo = "mojo run -I src examples/list_archive.mojo test/data/ustar.tar"
 
 [dependencies]
-mojo = ">=1.0.0b3,<2"
+mojo = ">=1.0.0b3.dev0,<2"
