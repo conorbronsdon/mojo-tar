@@ -24,6 +24,23 @@ container; for `.tar.gz` / `.tar.bz2`, pair it with a separate zlib/gzip
 library: decompress first, then hand the bytes to `open_tar` (or compress
 the bytes `TarWriter.finalize()` returns).
 
+### Coming from Python
+
+If you know Python's `tarfile`, reading and writing map like this:
+
+| Python (`tarfile`)                        | mojo-tar                                                |
+| ----------------------------------------- | ------------------------------------------------------- |
+| `tf = tarfile.open("a.tar")`              | `var entries = read_tar_file("a.tar")`                  |
+| `for m in tf.getmembers(): m.name, m.size`| `for e in entries: e.info.name, e.info.size`            |
+| `m.isdir()` / `m.issym()`                 | `e.info.isdir()` / `e.info.issym()`                     |
+| `tf = tarfile.open("a.tar", "w")`         | `var w = TarWriter()`                                   |
+| `tf.add(...)` / write member              | `w.add("f.txt", data, mode=0o644, mtime=0)`             |
+| close / flush to bytes                    | `var archive = w.finalize()  # List[UInt8]`             |
+
+`TarInfo` fields mirror `tarfile.TarInfo` (`name`, `size`, `mode`, `mtime`,
+`linkname`, …) with `isfile()` / `isdir()` / `issym()` / `islnk()` helpers.
+The writer also has `add_dir(name)` and `add_symlink(name, target)`.
+
 ## What it handles
 
 - **ustar format**, including the `prefix` field for long-path splitting.
@@ -131,7 +148,7 @@ content bytes; empty for directories and links). `TarInfo` fields mirror
 pixi run test
 ```
 
-24 tests cover header and numeric-field parsing, every fixture archive,
+29 tests cover header and numeric-field parsing, every fixture archive,
 GNU long names, pax path override, writer round-trips, base-256 and prefix
 decoding, and clean raises on garbage or truncated input. Fixtures under
 `test/data/` are produced by the system GNU `tar` binary
@@ -145,9 +162,11 @@ crashes.
 
 ## Part of a pure-Mojo library suite
 
-Ten pure-Mojo libraries that mirror familiar Python stdlib and PyPI APIs,
+Eleven pure-Mojo libraries that mirror familiar Python stdlib and PyPI APIs,
 filling gaps in the native Mojo ecosystem:
 
+- [mojo-xml](https://github.com/conorbronsdon/mojo-xml) — general-purpose XML
+  parsing, an ElementTree-shaped DOM (Python's `xml.etree.ElementTree`)
 - [mojo-feed](https://github.com/conorbronsdon/mojo-feed) — RSS, Atom, and
   JSON Feed parsing (Python's `feedparser`)
 - [mojo-captions](https://github.com/conorbronsdon/mojo-captions) — SRT and
