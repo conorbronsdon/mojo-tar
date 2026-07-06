@@ -15,13 +15,15 @@ please report it via a
 [GitHub issue](https://github.com/conorbronsdon/mojo-tar/issues),
 including the offending archive or a minimal reproduction.
 
-A member whose header fails its checksum is skipped as a whole unit
-(header plus its declared, padded data run), never one block at a time.
-Skipping only the header would let the member's data be reinterpreted as
-subsequent headers, so a file whose contents are themselves a valid tar
-could surface its inner members as top-level entries — a content-smuggling
-/ scanner-evasion differential. If a corrupt member's size is implausible,
-resync is impossible and the archive is rejected. GNU sparse members
+A member whose header fails its checksum aborts the parse with an error
+(mirroring CPython `tarfile`'s `ReadError`); the archive is rejected rather
+than resynced. A corrupt header cannot be trusted to say where its member's
+data ends: its size field is attacker-controlled, and a crafted size (for
+example 0) would make a "skip the member" resync advance only a single block,
+reinterpreting the member's data as the next headers. That is a
+content-smuggling / scanner-evasion differential — a file whose contents are
+themselves a valid tar could surface its inner members as top-level entries —
+so mojo-tar refuses to guess and raises instead. GNU sparse members
 (typeflag `S`, or `GNU.sparse.*` pax records) are likewise rejected rather
 than mis-read, because their archived length differs from their logical
 size and would desync the parse.

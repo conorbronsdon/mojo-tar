@@ -265,40 +265,20 @@ def _parse_archive(
                 raise Error(
                     "mojo-tar: bad checksum in first block (not a tar archive?)"
                 )
-            # Skip the WHOLE member -- header PLUS its (padded) data run --
-            # never just the header. Advancing a single block would
-            # reinterpret this member's data as the next headers, so a file
-            # whose contents are themselves a valid tar would surface its
-            # inner members as top-level entries (content smuggling /
-            # scanner-evasion differential). The size field is untrusted on
-            # a corrupt block, so only resync when it is plausible; abort
-            # otherwise rather than guess at where the data ends.
-            var bad_size = _get_num(block, 124, 12)
-            if bad_size < 0 or bad_size > n:
-                raise Error(
-                    "mojo-tar: unrecoverable bad checksum at offset "
-                    + String(pos)
-                    + " (implausible member size, cannot resync)"
-                )
-            var skip_end = pos + BLOCKSIZE + _padded(bad_size)
-            if skip_end > n:
-                raise Error(
-                    "mojo-tar: unrecoverable bad checksum at offset "
-                    + String(pos)
-                    + " (member data runs past end, cannot resync)"
-                )
-            warnings.append(
-                "mojo-tar: skipped member with bad checksum at offset "
+            # A bad checksum on a non-first block is unrecoverable, and we
+            # must NOT resync using the header's size field: on a corrupt
+            # block that field is attacker-controlled. A crafted size of 0
+            # (or any value that lands the skip a single block ahead) would
+            # degrade the skip to just this header block and reinterpret the
+            # member's data as the next headers -- the exact content-smuggling
+            # / scanner-evasion vector this guard exists to close. There is no
+            # trustworthy way to learn where the member's data ends, so mirror
+            # CPython `tarfile`'s ReadError and abort rather than guess.
+            raise Error(
+                "mojo-tar: bad checksum at offset "
                 + String(pos)
+                + " (header untrusted; cannot safely resync, aborting)"
             )
-            pos = skip_end
-            # A corrupt member must not carry pending extension-header
-            # overrides (GNU long name/link, pax) forward onto a later
-            # member; drop any that were pending.
-            have_long_name = False
-            have_long_link = False
-            pax.clear()
-            continue
 
         var info = _parse_header(block)
         pos += BLOCKSIZE

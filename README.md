@@ -32,9 +32,11 @@ the bytes `TarWriter.finalize()` returns).
   `linkpath` keyword records are honored; other records are skipped.
 - **Octal and base-256 numeric fields.**
 - **512-byte block padding** and end-of-archive zero-block detection.
-- **Liberal where safe**: a member with a bad checksum is skipped and
-  recorded in `TarReader.warnings` rather than aborting the whole archive.
-  A garbage leading block or a truncated member raises cleanly.
+- **Strict on corruption**: a member whose header fails its checksum aborts
+  the parse (like CPython `tarfile`'s `ReadError`). A corrupt header cannot be
+  trusted to say where its data ends, and resyncing on its size field is a
+  content-smuggling bypass, so the archive is rejected rather than skipped. A
+  garbage leading block or a truncated member likewise raises cleanly.
 - **Writing**: `TarWriter` emits ustar archives from `(name, bytes, mode,
   mtime)` entries, plus `add_dir` and `add_symlink`. Names longer than 100
   bytes get a leading pax `path` extended header automatically, so the

@@ -292,9 +292,11 @@ def test_ustar_prefix_split() raises:
 # --- lenient parsing and error handling --------------------------------
 
 
-def test_bad_checksum_member_skipped() raises:
-    # A middle member (a directory, so it has no data blocks) with a
-    # corrupted header is skipped, not fatal; the others survive.
+def test_bad_checksum_member_raises() raises:
+    # A middle member with a corrupted header aborts the parse: the header
+    # is untrusted, so we cannot know where its data ends and must not
+    # resync on the attacker-controlled size field. (Previously this was a
+    # lenient skip; the resync was a smuggling bypass and now raises.)
     var w = TarWriter()
     w.add("first.txt", String("AAAA").as_bytes())  # header + 1 data block
     w.add_dir("baddir")  # single header block at offset 1024
@@ -303,12 +305,8 @@ def test_bad_checksum_member_skipped() raises:
     # Corrupt the directory header's name byte (offset 1024) without
     # fixing its checksum -> checksum mismatch on that block only.
     archive[1024] = UInt8(ord("Z"))
-    var reader = TarReader(Span(archive))
-    var names = reader.names()
-    assert_equal(len(names), 2)
-    assert_equal(names[0], "first.txt")
-    assert_equal(names[1], "last.txt")
-    assert_true(len(reader.warnings) >= 1)
+    with assert_raises():
+        _ = open_tar(Span(archive))
 
 
 def test_garbage_input_raises() raises:
@@ -500,15 +498,37 @@ def test_bad_checksum_data_not_reinterpreted() raises:
     # Corrupt the second member's name byte -> checksum mismatch, size intact.
     archive[1024] = UInt8(ord("Z"))
 
-    var reader = TarReader(Span(archive))
-    var names = reader.names()
-    # The whole corrupt member (header + data) is skipped as a unit; the
-    # smuggled inner member never appears.
-    for name in names:
-        assert_true(name != "SMUGGLED.txt")
-    assert_equal(len(names), 1)
-    assert_equal(names[0], "readme.txt")
-    assert_true(len(reader.warnings) >= 1)
+    # A bad-checksum member aborts the parse, so the smuggled inner member is
+    # never surfaced. The parse must raise -- not skip-and-continue, which
+    # relied on the untrusted size field and was itself bypassable.
+    with assert_raises():
+        _ = open_tar(Span(archive))
+
+
+def test_bad_checksum_zero_size_bypass_raises() raises:
+    # Regression for the resync bypass: the smuggling guard used to skip a
+    # bad-checksum member by `pos + BLOCKSIZE + _padded(size)`, reading `size`
+    # from the corrupt, attacker-controlled header. A crafted size of 0 passed
+    # the plausibility gate and made the skip advance exactly one block --
+    # degrading to the old single-block skip and reinterpreting the member's
+    # data as top-level headers (the exact smuggling vector). Zeroing the size
+    # must now raise, not surface the smuggled inner member.
+    var inner = TarWriter()
+    inner.add("SMUGGLED.txt", String("hidden-evil-payload\n").as_bytes())
+    var inner_bytes = inner.finalize()
+
+    var outer = TarWriter()
+    outer.add("readme.txt", String("ok").as_bytes())  # header@0, data@512
+    outer.add("innocent.dat", Span(inner_bytes))  # header@1024, data@1536+
+    var archive = outer.finalize()
+
+    # Corrupt the second member's checksum AND force its size field to 0, the
+    # value that made the old resync collapse to a one-block skip.
+    archive[1024] = UInt8(ord("Z"))  # break checksum
+    _put_octal(archive, 1024 + 124, 12, 0)  # size = 0 (crafted bypass)
+
+    with assert_raises():
+        _ = open_tar(Span(archive))
 
 
 def test_bad_checksum_implausible_size_raises() raises:
