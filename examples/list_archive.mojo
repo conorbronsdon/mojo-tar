@@ -31,7 +31,9 @@ def main() raises:
     print()
 
     for e in entries:
-        var line = _type_char(e.info) + " " + String(e.info.size) + "\t" + e.info.name
+        var line = (
+            _type_char(e.info) + " " + String(e.info.size) + "\t" + e.info.name
+        )
         if e.info.linkname.byte_length() > 0:
             line += " -> " + e.info.linkname
         print(line)
