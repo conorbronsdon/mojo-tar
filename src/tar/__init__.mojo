@@ -1,4 +1,4 @@
-"""mojo-tar: pure-Mojo tar archive reading and writing (mirrors `tarfile`)."""
+"""Tar archive reading and writing in pure Mojo, mirroring `tarfile` (mojo-tar)."""
 
 from tar.model import (
     TarInfo,

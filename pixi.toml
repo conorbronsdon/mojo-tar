@@ -10,6 +10,9 @@ version = "0.1.0"
 test = "mojo run -I src test/test_tar.mojo"
 fuzz = "mojo run -I src test/fuzz_runner.mojo test/data/ustar.tar"
 demo = "mojo run -I src examples/list_archive.mojo test/data/ustar.tar"
+bench = "mojo build -I src bench/bench_read.mojo -o .bench_read && ./.bench_read"
+fmt = "mojo format src/ test/ examples/ bench/"
+docs = "mojo doc -o docs/api.json -I src src/tar && python3 docs/render_api.py docs/api.json docs/api.html"
 
 [dependencies]
 mojo = ">=1.0.0b3.dev0,<2"

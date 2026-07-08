@@ -4,3 +4,7 @@ pixi.lock
 *.mojopkg
 __pycache__/
 test/data/src_tree/
+.bench_read
+docs/api.json
+docs/api.html
+docs/site/
